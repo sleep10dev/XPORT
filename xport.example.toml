@@ -1,0 +1,14 @@
+# Exemplo de configuração local (não commitar xport.toml com paths privados)
+
+[paths]
+# Diretório do título/jogo (fornecido pelo usuário, fora do repo)
+game_dir = "D:/Games/ExampleTitle"
+
+# Onde dados derivados/cache podem ser escritos (fora do repo)
+cache_dir = "%LOCALAPPDATA%/XPORT/cache"
+
+# Onde logs/relatórios podem ser escritos (fora do repo)
+data_dir = "%LOCALAPPDATA%/XPORT/data"
+
+# Títulos adicionais para testes de plataforma
+# test_titles = ["D:/Games/OtherTitle"]

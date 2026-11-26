@@ -1,0 +1,37 @@
+/target
+**/*.rs.bk
+Cargo.lock
+target.tmp/
+
+# Local config and generated/runtime data
+xport.toml
+/report.json
+/cache/
+/logs/
+/overlay/
+/saves/
+
+# IDE/editor
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Test/sample artifacts (never commit proprietary data)
+*.iso
+*.xvc
+*.msixvc
+*.exe
+*.dll
+*.pdb
+*.rpf
+*.bk2
+*.wav
+*.mp4
+*.png
+*.dds
+*.ktx
+*.bin
+!xtask/src/policy-exceptions.txt

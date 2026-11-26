@@ -1,0 +1,46 @@
+[workspace]
+resolver = "3"
+members = ["crates/*", "apps/*", "xtask"]
+exclude = ["tests/fixtures"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+license = "GPL-3.0-or-later"
+publish = false
+
+[workspace.dependencies]
+anyhow = "1"
+thiserror = "2"
+clap = { version = "4", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+object = { version = "0.41", default-features = false, features = ["read_core", "pe", "coff", "archive", "std"] }
+tempfile = "3"
+blake3 = "1"
+
+xport-core = { path = "crates/xport-core" }
+xport-pe = { path = "crates/xport-pe" }
+xport-loader = { path = "crates/xport-loader" }
+xport-vfs = { path = "crates/xport-vfs" }
+xport-hle = { path = "crates/xport-hle" }
+xport-gpu = { path = "crates/xport-gpu" }
+xport-shader = { path = "crates/xport-shader" }
+xport-formats = { path = "crates/xport-formats" }
+xport-report = { path = "crates/xport-report" }
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+unused_must_use = "deny"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+
+[profile.release]
+debug = "line-tables-only"
+
+[profile.diag]
+inherits = "release"
