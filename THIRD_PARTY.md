@@ -30,6 +30,57 @@ do XPORT, ativados automaticamente apenas para o hash verificado
 próprio título, são logados uma vez e não alteram bytes da imagem. Não são
 diagnósticos e não dependem de variáveis de ambiente.
 
+## API gráfica pública (Lote 101 / Fase 1 — 2026-11-26)
+
+- `crates/xport-shader/src/lib.rs`, `src/dxc.rs`, `src/gpu/xbox.rs` e
+  `tests/dxc_graphics.rs`: código autoral do XPORT. A API pública
+  (`translate_xbox_graphics`, `compile_xbox_graphics`) expõe o recompilador
+  interno `gpu::recomp` (VS/PS), sem importar código novo de terceiros.
+- Os containers VS/PS usados nos testes são gerados pelo próprio XPORT
+  (`gpu::xbox::synthetic`); nenhum shader, dump, stream, textura ou outro dado
+  do título foi lido ou copiado para o repositório.
+- O teste DXC é opt-in e usa apenas `dxil.dll`/`dxcompiler.dll` do Windows Kits
+  instalado no sistema; nenhum binário é vendido ou commitado.
+
+## Pipeline gráfico e captura (Lotes 103-104 / Fases 3-4 — 2026-11-26)
+
+- `crates/xport-gpu/src/d3d12.rs`: assinatura root, PSO, RTV/DSV/SRV/sampler,
+  upload, viewport/scissor, `DrawInstanced`, readback e `IASetVertexBuffers`
+  são código autoral escrito contra a API pública do `windows` crate 0.62.2.
+  O VS fullscreen com `SV_VertexID` e os containers sintéticos de textura são
+  autorais. Nenhum shader, blob DXIL, textura, stream ou tabela binária do
+  título foi copiado ao repositório.
+- `crates/xport-hle/src/modules/d3d12_null.rs`: `XPORT_CAPTURE_CL=1` é um
+  diagnóstico opt-in e desligado por padrão; lê, via `ReadProcessMemory`, no
+  máximo duas submissões e imprime em stderr os ponteiros de `lists[]`, o token,
+  128/256 bytes dos objetos e 128 bytes do array de planos de `queue_present`.
+  Nada é escrito pelo XPORT: a saída vai para o
+  redirecionamento de stderr do host, fora do repo. Nenhum patch de bytes do
+  título foi aplicado.
+- As execuções de reconhecimento da Fase 4 usaram apenas `RUST_LOG` e variáveis
+  opt-in, com timeout e saídas em `%LOCALAPPDATA%\Temp\opencode`. Nenhum dump,
+  asset, DLL, shader ou captura de jogo entrou no XPORT.
+
+## Slots do layout mais novo (Lotes 105-106 / Fase 4 — 2026-11-26)
+
+- `crates/xport-hle/src/modules/d3d12_list_sync.rs` e
+  `d3d12_page_pool.rs`: lógica autoral do XPORT. Os números de slot e a ABI
+  (`Write32BitValueBottomOfPipeX`, `Write64BitValueBottomOfPipeX`,
+  `Wait64BitValueX`, `Reset`, `RegisterPagePoolX`) são fatos públicos do layout
+  documentados no fork licenciado `xcl-nvidia-dev` (`d3d12_layout.rs`,
+  `d3d12x/list_x.rs`, `d3d12x/device_x.rs`, `d3d12x/console_list.rs`); nenhum
+  corpo de função, tabela ou dado do fork foi copiado.
+- `crates/xport-hle/src/modules/d3d12_null.rs`: os bodies dos slots
+  `#32/#52/#72/#74/#139/#146` e `#75` foram reescritos no XPORT. O despacho por
+  `Kind` mantém vtables separadas para device e command list. Nenhum byte do
+  título foi patchado.
+- Escritas de sincronização são opt-in (`XPORT_LIST_APPLY_WRITES=1`), pois os
+  VAs observados são offsets em memória unificada não mapeada pelo dispositivo
+  offline; escrever neles como endereços host causava uma exceção no título.
+- `XPORT_LOG_LIST_OPS`, `XPORT_LOG_PAGE_POOL`, `XPORT_DUMP_OBJ` e
+  `XPORT_CAPTURE_CL` são diagnósticos opt-in, desligados por padrão, que apenas
+  imprimem no stderr do host (fora do repo) via `ReadProcessMemory`.
+
 ## Ported files (Lote 1 - 2026-11-24)
 
 | XPORT file | Upstream source | Notes |
@@ -659,3 +710,77 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+## Lotes 115–118 (26/11/2026) — ABI APU/HAL e shims de compatibilidade
+
+- `crates/xport-hle/src/modules/apu_bridge.rs`: a ABI console de
+  `AcpHalAllocateShapeContexts` (um único `ShapeContexts*` com `counts: [u32;5]`,
+  `reserved: u32` e `contexts: [*mut c_void;5]`), `ApuAlloc`, `ApuFree`,
+  `ApuMapApuAddress`, `ApuMapVirtualAddress`, `ApuHeapGetState` e a vtable de
+  6 slots de `AcpHalCreate` foram adaptadas de `xcl-nvidia-dev`
+  (`crates/xcl/src/hle/acphal.rs`, GPL-2.0-only; relicenciamento autorizado
+  pelo proprietário para GPL-3.0-or-later no XPORT). Os corpos, validações e
+  mensagens de erro são do XPORT; nenhum arquivo do fork foi copiado.
+- `crates/xport-loader/src/crash.rs`: os shims de compatibilidade são código
+  autoral. Eles reconhecem exceções em RVAs exatos do build verificado e
+  retomam a própria instrução seguinte do título — watchdog, fonte nula, slot
+  gráfico indisponível e helper inutilizável. Detectam `call` indireto
+  (`ff /2` com REX/disp32 opcionais) lendo os bytes da imagem já mapeada e
+  validando a palavra de vtable em memória. Emular o `ret` da chamada pulada
+  preserva a pilha do chamador. Nenhum byte da imagem é alterado e nenhum dado
+  do título é gravado no repositório; todo diagnóstico é opt-in.
+- `crates/xport-hle/src/modules/d3d12_va_map.rs`: o guard em `copy()` é autoral,
+  falha fechada para tamanho zero/ponteiro nulo e remove um panic de
+  precondition do runtime.
+
+## Lote 120 (26/11/2026) — XSEmu e leitura das planes de `PresentX`
+
+- O proprietário autorizou em 2026-11-26 que o código autoral do
+  [XSEmu](https://github.com/xemu-project/XSEmu) (GPL-2.0-only no snapshot local
+  `XSEmu-main`) seja tratado como seu e relicenciado para GPL-3.0-or-later no
+  XPORT, com a mesma regra já aplicada a VIctory/XCL: preservar atribuição e
+  auditoria de componentes de terceiros antes de cada port.
+- `crates/xport-hle/src/modules/d3d12_present.rs`: o layout das planes de
+  `PresentX` (stride `0x48`, token @0, resource count @8, resource list @0x10) e
+  a ideia de acompanhar o recurso apresentado vêm de
+  `crates/xcl/src/hle/d3d12x/present.rs` no XSEmu. O corpo é autoral: leitura
+  limitada com `ReadProcessMemory`, nenhum ponteiro de título é mantido, nenhum
+  byte é copiado ao repositório e nenhuma janela ou swapchain de host é criada.
+- As partes de terceiros do XSEmu não foram portadas nesta fatia: AnyPS5
+  (GPL-2.0-only, sem autorização de relicenciamento aqui declarada), FFmpeg
+  (LGPL-2.1+), AMD ISA e Mesa addrlib (MIT), LLVM (Apache-2.0 WITH
+  LLVM-exception), DirectX-Headers (MIT) e WinDurango (LGPL-3.0, apenas fatos
+  de exportação). Se alguma dessas áreas for portada depois, este arquivo deve
+  ser atualizado com o aviso e a licença correspondentes.
+
+## Lote 122 (26/11/2026) — command list console-shaped
+
+- O formato da lista entregue ao título foi conferido no código autoral do
+  XSEmu (`crates/xcl/src/hle/d3d12x/title_list.rs`, GPL-2.0-only no snapshot,
+  relicenciado para o XPORT pelo proprietário): objeto de `0x3000` bytes,
+  `write`/`dispatch_end`/`end` iguais a `base+0x1000`, estado em `+0x2f00` e
+  ponteiro de volta em `+0x2ff0/+0x2ff8`. A igualdade dos ponteiros força os
+  writers inline a caírem na vtable; o stream não é decodificado.
+- `crates/xport-hle/src/modules/d3d12_null.rs`: implementação própria do
+  formato e do estado interno; os números de slot e o esquema de remapeamento
+  console foram usados apenas como fatos de ABI, sem copiar funções, thunks,
+  comentários ou tabelas do XSEmu. O decoder compute-only
+  (`XCL_CONSOLE_LISTS`) continua fora do caminho gráfico do XPORT.
+- `XPORT_LOG_CL_SHAPE`, `XPORT_LOG_CL_CALLS` e `XPORT_LOG_XMEM_ALLOC` são
+  diagnósticos opt-in autorais, desligados por padrão. Nenhum packet, stream,
+  shader, textura ou dado de título foi gravado no repositório.
+- `XPORT_REPORT_ALLOC_ASSERT=1` e a classificação da assertion recuperada pelo
+  próprio título são lógica do XPORT, sem código do XSEmu. Nenhuma imagem, DLL,
+  dump ou tabela binária do título entrou no repo.
+
+## Lote 123 (26/11/2026) — reserva XMem preguiçosa
+
+- `crates/xport-loader/src/crash.rs` e `crates/xport-hle/src/modules/xmem.rs`:
+  shim autoral de compatibilidade. O HLE registra intervalos devolvidos por
+  `XMemVirtualAlloc`; o VEH comita até 64 KiB somente para uma escrita inválida
+  dentro de um intervalo registrado cujo estado host é `MEM_RESERVE`. Nenhum
+  endereço arbitrário é comitado e nenhum byte da imagem do título é alterado.
+- O diagnóstico `XPORT_LOG_XMEM_ALLOC` e o teste que força a condição são
+  originais; nenhum código, comentário, tabela ou dado do XSEmu/terceiros foi
+  portado nesta fatia. Os componentes de terceiros listados no Lote 120
+  permanecem excluídos.

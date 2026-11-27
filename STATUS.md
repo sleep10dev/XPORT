@@ -2,6 +2,208 @@
 
 Atualizado em 2026-11-26.
 
+## Lote 125 — em andamento: trace com queue/fence corretos e mapeamento de RVA
+- Corrigida recursão acidental em `queue_base_vtable`/`fence_base_vtable` (`inner` agora é a única fonte do `OnceLock`). `d3d12_vtable_trace::call` passou a escolher a tabela base por `diag_kind`, preservando `PresentX`/`Signal` de queue e `Signal` de fence com trace instalado. `XPORT_LOG_CL_CALLS` sozinho agora também instala o trace (antes não instalava).
+- Novo diagnóstico opt-in `XPORT_LOG_CL_SHAPE` no `Close`: `scarlett-tracefix-20261126-194302` (60 s) mostrou 8 listas com `write=disp=end=room` e `changed=false` — o título não avança os inline writers, então não há records inline para decodificar.
+- A mesma captura teve `presents=0`; distribuição de slots segue sem nenhum gráfico (só `#9`, `#131`/`#132` em command list, 585 `Close`). Captura longa de 180 s em curso para decidir se o present só aparece depois dos ~1000 `CreateDerivedPipelineStateX`.
+- `scarlett-exit-20261126-193821` (`XPORT_LOG_EXIT`/`XPORT_LOG_UNHANDLED`, opt-in): 735 `int3` em `+0x56abfa5` e 100 `0xc0000005` em `+0x161b994` (leitura de `0x8`) intercalados; sem opt-ins a execução segue limpa. Mapeamento confirmado: os RVAs dos logs são os RVAs originais do PE (`address - HMODULE`); meu script de desmontagem estava com o cálculo de seções errado. `+0x56abfa5` é `int3` real e `+0x161b994` é `mov r12,[rax+8]` com `rax=0` — as duas falhas são reais, não artefato de RVA.
+- `scarlett-tracelong-20261126-194426` (180 s): `presents=0`, 7154 chamadas de `#57 device`, 585 `Close`, nenhum slot gráfico. `close shape` sempre `changed=false`.
+- `scarlett-notrace-20261126-194744` (sem trace): terminou sozinho com `status=executed`, **`presents=0`**, e voltou o `0xc0000005` em `+0x1f76f88` (escrita em `0x237cbf15010`; `allocation=0x237cbd30000 region=0x1b000`). O endereço ficou fora da janela registrada pelo lazy commit do Lote 123; não é artefato do trace. Diagnóstico com `XPORT_LOG_XMEM_ALLOC=1` em curso.
+- `scarlett-dsbytes-20261126-193720`: 2872 heads inflados, nenhum `DXBC`/`9FPR` (vários `ffffffff` e padrões de floats/índices); não prova decoder RPF ausente. Nada alterado ainda.
+- Correção diagnóstica: `d3d12_vtable_trace` agora preserva `GetLastError` ao redor do log e da escolha da tabela, sem alterar o valor publicado pelo handler real.
+- **Causa raiz do AV reativo identificada e corrigida:** `commit_lazy_reservation` calculava `region_end = AllocationBase + RegionSize`, mas `RegionSize` é medido a partir de `BaseAddress`. Na reserva de `0x1b00000` (`XMemVirtualAlloc #11`), o endereço `+0x1e5010` estava dentro da janela registrada, porém o cálculo errado devolvia `len=0` e o commit nunca acontecia. Agora usa `BaseAddress + RegionSize` e também reconhece sub-regiões pelo `AllocationBase` registrado. `cargo test -p xport-loader --lib` passou (6 testes); falta recompilar o CLI e repetir a execução real.
+- Validação completa passou: `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace -q -- --skip llvm_gfx10_corpus`, `cargo build -p xport-cli`.
+- **`scarlett-lazyfix-20261126-195441` (150 s, só `XPORT_LOG_PRESENT_PLANES=1`): 4 presents, tokens 1–4 alternando os dois back buffers, `status=executed`, `imports_missing=0`, 4 linhas de log — zero exceções e zero recuperações.** A correção do `region_end` resolveu o AV intermitente que fazia o título encerrar sem apresentar.
+- Em curso: amostragem de pixels no present (`XPORT_LOG_PRESENT_PIXELS=1`) e nova captura de slots com trace. Nada commitado; nenhum dado de título copiado ao repo.
+
+## Lote 124 — em andamento: calls de método na command list
+- Objetivo: descobrir por que `cl_calls=0`/`rt0_binds=0` apesar de `presents=4`, e ligar `OMSetRenderTargets`/draws ao backing do back buffer sem decodificar stream gráfico.
+- Mapas autorizados confirmaram: XSEmu não usa hooks por RVA para gráficos; ele embrulha uma command list PC real e classifica chamador pelo endereço de retorno. XPORT já tem o formato console (`0x3000`, `write==end==base+0x1000`) mas não tem backing PC, e o HLE não liga vtables ao `xport-gpu`.
+- `scarlett-allslots-now-20261126-192219`: 500 linhas de trace; slots observados em command list foram apenas `#9` (`Close`, com registradores sujos), `#131`/`#132` (`FlushCacheRangeX`). Nenhum `#12`/`#50`/`#139`/`#146`.
+- `scarlett-frameevents-20261126-192655`: presents 1–4 e frame tokens até `0x1a`; o loop avança, mas sem pixels.
+- `scarlett-pixels2-20261126-192927`: backing dos dois recursos apresentados está zerado (`nz=0/64` em `+0`, `+0x1000`, `+0x10000`, `+0x100000`).
+- Novo diagnóstico opt-in `XPORT_LOG_DISPLAY_ARENA=1` em `d3d12_null.rs`: `scarlett-arena-20261126-193048` mostrou as duas arenas de display do título (`0x3e10000` e `0x1000`) também zeradas; aliasá-las ao recurso não resolveria sozinho.
+- `scarlett-afterpresent-20261126-193158`: 504 linhas após o primeiro present, **zero chamadas de command list**. Só `pipeline_state #1/AddRef` (137×) e `device #55 CreateDerivedPipelineStateX` (274×) — o título está compilando/construindo PSOs, sem draws.
+- `scarlett-long-20261126-193353` (600 s): processo terminou sozinho com `status=executed`, `present #1..#4`, sem calls gráficas. O filtro `XPORT_LOG_CL_CALLS` sozinho não instala a vtable de trace; é necessário `XPORT_LOG_ALL_SLOTS=1` junto.
+- Pesquisa autorizada confirmou: D3D12.X inline writers entram na lista quando `write < end`; o XSEmu garante o fallback para método explícito deixando `+0x18=+0x28=+0x30=base+0x1000` — o XPORT já faz isso. Não há registro de stream gráfico separado; draws do título chegam por slots de método, não por records inline interpretados.
+- Pesquisa RPF/DStorage: o runtime do XSEmu também não parseia RPF; a suspeita de bytes crus explicaria DXBC inválido, mas precisa confirmação por `XPORT_LOG_DS_BYTES`. XPORT não tem decoder RPF; BCPack rejeitado explicitamente.
+- Diagnósticos adicionados (opt-in): `XPORT_LOG_DISPLAY_ARENA` registra as arenas e `XPORT_LOG_PRESENT_PIXELS` agora as amostra no momento do present; `XPORT_TRACE_CAP` permite elevar o limite do trace.
+- Em curso: execução longa com `XPORT_LOG_ALL_SLOTS=1 XPORT_LOG_CL_CALLS=1 XPORT_TRACE_CAP=20000` para procurar slots gráficos além das primeiras 500 chamadas. Nada commitado; nenhum dado de título copiado ao repo.
+
+## Lote 123 — Fase 5: reserva XMem preguiçosa e validação limpa (concluído)
+- O `0xc0000005` intermitente em `+0x1f76f88` era a inicialização do alocador interno do título (`+0x1f76f20` → `+0x156c240`) escrevendo em uma reserva host `MEM_RESERVE` nunca comitada. Não era ponteiro forjado nem byte de imagem patchado.
+- Shim autoral: `xport-loader::register_lazy_range()` registra os intervalos devolvidos por `XMemVirtualAlloc`; o VEH comita no máximo 64 KiB somente numa escrita inválida cujo endereço está num intervalo registrado e cujo estado host é `MEM_RESERVE`. Endereços fora do registro continuam falhando explicitamente; a imagem do título não é alterada. `XPORT_LOG_XMEM_ALLOC`/`XPORT_LOG_PRESENT_PLANES` continuam opt-in.
+- Teste unitário `lazy_reservation_commit_makes_registered_range_writable` reserva uma página host, dispara o helper e verifica a escrita; passou no workspace.
+- A assertion `+0x56abfa5` segue intermitente e é recuperada pelo próprio handler do título; é anunciada como `recovered offline allocator assertion` e contada como exceção bruta apenas com `XPORT_REPORT_ALLOC_ASSERT=1`.
+- Validação completa: `cargo fmt --all`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace -q -- --skip llvm_gfx10_corpus`, `cargo build -p xport-cli`: todos exit 0.
+- `scarlett-present-lazy-20261126-191806`: `presents=4`, `exceptions=0`, 1 recuperação declarada. `scarlett-final-lazy-20261126-191935` (150 s, sem opt-ins/rede): `missing=0`, `exceptions=0`, `panics=0`, 1 recuperação declarada, shim de commit não disparou. Quatro execuções limpas anteriores também terminaram sem `0xc0000005`.
+- Próximo passo exato: seguir hooks de método (`title_list` → guard → slots) até `OMSetRenderTargets`/RT0 e draws, depois ligar o backing de pixels ao recurso apresentado; sem estender o decoder compute-only para gráficos. Nenhum dado de título foi copiado ao repo; nada commitado.
+
+## Lote 122 — Fase 5: command list console-shaped e validação (concluído)
+- Levantamento do XSEmu (subagent) confirmou que o caminho gráfico não decodifica stream: a lista entregue ao título tem formato console com `write == end`, forçando os writers inline a caírem na vtable. O decoder de stream do XSEmu é compute-only (`XCL_CONSOLE_LISTS=1`) e não cobre draws.
+- Portada a ideia autoral em `d3d12_null.rs`: `Kind::CommandList` usa objeto de `0x3000` bytes com `+0x18/+0x28/+0x30` apontando para `base+0x1000` (sem espaço), estado interno em `+0x2f00` e ponteiro de volta em `+0x2ff0/+0x2ff8`. `obj()` reconhece o formato; `create_command_list` escreve no estado interno. Corrigidos o overflow de `copy_nonoverlapping` (contagem de elementos, não bytes) e o teste DXGI (formato `28`).
+- `XPORT_LOG_CL_SHAPE=1` mostrou 101 submissões com `used=0`, `room_nonzero=0` e o objeto intacto — o formato está correto, mas o título não emitiu calls gráficas observáveis na lista sintética; `XPORT_LOG_CL_CALLS=1` registrou `cl_calls=0`.
+- A assertion `0x56abfa5` é intermitente e interna ao alocador de classes de tamanho do próprio título: base limpa teve 2/3 execuções sem ela. `XPORT_TEST_ALLOC_RETRY` (retry com yield) e as rotas alternativas/fake já testadas não são correções e foram removidas. Nenhum byte da imagem foi patchado.
+- `crash.rs` agora classifica esse `int3` recuperado pelo próprio handler do título separadamente (`recovered offline allocator assertion`) e mantém `XPORT_REPORT_ALLOC_ASSERT=1` para contabilizar a ocorrência bruta. Não é uma correção do alocador; é uma distinção explícita entre falha não tratada e recuperação interna.
+- `scarlett-measure-20261126-185136` (com `XPORT_LOG_PRESENT_PLANES=1 XPORT_REPORT_ALLOC_ASSERT=1`): `presents=4`, tokens 1–4 alternando os dois recursos de back buffer, `exceptions=1` bruta. `scarlett-finalclean1/2` (150 s, sem opt-ins/rede): `missing=0`, `panics=0`, `exceptions=0`; a segunda teve 1 recuperação declarada.
+- **A validação final ainda não fechou:** `scarlett-clean-final-20261126-185315` (150 s, sem opt-ins/rede) terminou com `0xc0000005` em `+0x1f76f88`, escrita em página reservada nunca comitada (`0x1834a926010`). Stack: `+0x1f76f88` ← `+0x2478f46` ← `+0x19f4f54` ← `+0x580437e` ... O mesmo RVA apareceu em `scarlett-retry3-3`; é intermitente e independente da assertion.
+- Desmontagem: `+0x1f76f20` chama o alocador de classes `+0x156c240` (bump sobre uma região com limites em `[rcx+8]/[rcx+0x10]`) e escreve dwords sequenciais no ponteiro devolvido. `XPORT_LOG_XMEM_ALLOC=1` (novo, opt-in) mostrou 17 reservas; a suspeita é uma reserva console (`MEM_GRAPHICS`/`MEM_RESERVE`) mapeada como `MEM_RESERVE` host sem commit. Investigação em andamento; nenhuma correção aplicada ainda.
+- Validação de código passou: `cargo fmt --all`, `cargo test --workspace -q -- --skip llvm_gfx10_corpus`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo build -p xport-cli`.
+- Desfecho: o `0xc0000005` e a validação foram tratados no Lote 123 (reserva XMem preguiçosa). O próximo passo atual é seguir hooks de método até `OMSetRenderTargets`/draws e ligar o backing ao back buffer, sem estender o decoder compute-only para gráficos. Nenhum dado de título foi copiado ao repo; nada commitado.
+
+## Lote 121 — Fase 5: mapeamento RTV→recurso e relatório de shutdown (concluído)
+- `crash.rs` ganhou `stop_reporting()`, chamada em `main.rs` após `main.join()`: exceções de primeira chance de DLLs do sistema no teardown do host deixam de ser atribuídas ao título.
+- `XPORT_LOG_RTV_CREATE=1` (opt-in) mostrou que os dois recursos apresentados alternados são exatamente os RTVs criados pelos slots 19/20; `note_rtv` agora recebe o slot de origem.
+- `XPORT_LOG_PRESENT_PIXELS=1` (opt-in) amostra 64 bytes em quatro offsets do recurso; o valor lido começa com uma vtable de host, ou seja, o endereço amostrado é a estrutura `Obj`, não o backing de pixels.
+- `scarlett-pixels-20261126-173422`: `exceptions=0`, `presents=4`, tokens 1–4 alternando `0x1b06cfc83e0`/`0x1b06cfc8360`.
+- Validação parcial passou: `cargo fmt --all`, `cargo test -p xport-hle --lib -q`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo build -p xport-cli`.
+- Próximo passo exato: expor o backing `(host, len)` do `Obj::Resource` e amostrar pixels a partir dele; depois repetir validação completa e execução real limpa.
+
+## Lote 120 — Fase 5: reuso autorizado do XSEmu, planes de `PresentX` (26/11/2026)
+- Usuário autorizou tratar o código autoral do XSEmu como seu e relicenciá-lo para GPL-3.0-or-later no XPORT, preservando atribuição e auditando terceiros antes de portar.
+- Survey completo do XSEmu identificou presentation/frame/fence, recompilador RDNA2→DXIL, DirectStorage/BCPack, APU/XMA/Opus, kernel/XGameRuntime e loader/VFS como áreas reutilizáveis. Nenhum dado de título está comitado no XSEmu; fixtures são sintéticos ou vetores públicos.
+- Primeiro port efetivo: `crates/xport-hle/src/modules/d3d12_present.rs` implementa o layout das planes de `PresentX` (stride `0x48`, token @0, contagem @8, lista @0x10), leitura limitada via `ReadProcessMemory`, contadores e log opt-in `XPORT_LOG_PRESENT_PLANES`. Corpo autoral, sem janela/swapchain e sem gravar bytes do título no repo.
+- `queue_present` agora usa o parser para o token e registra o flip; o frame clock permanece inalterado.
+- Validação passou: `cargo fmt --all`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace -q -- --skip llvm_gfx10_corpus` e `cargo build -p xport-cli`.
+- Execução real `scarlett-present-20261126-164004`: `missing=0`, `present #1 planes=1` com `token=1`, `resource_count=1`, primeiro recurso lido; ainda `1` exceção em `0x321ec` e `0` panics. Isso confirma o parser, não a correção da ABI do campo.
+- Próximo passo: portar seletivamente o pareamento RTV/RT0 do XSEmu para identificar qual objeto sintético é o back buffer e só então ligar um caminho de apresentação real.
+
+## Lote 119 — Fase 5: rastreamento do escritor de `this+0x127c8` (26/11/2026, interrompido)
+- Varredura estática da `.text` (capstone, imagem em cache fora do repo) encontrou apenas escritas de 1 byte em `+0x127c8` em objetos alheios; nenhum `mov` de 32/64 bits no título escreve esse campo. Portanto o valor truncado não vem de um `mov` direto do título.
+- O shim passou a exigir uma lista explícita de RVAs de `call` virtual (`VIRTUAL_CALL_SITES`), evitando silenciar exceções não relacionadas; `scarlett-rvagate` confirmou o mesmo shim único em `0x327c5` e a mesma falha em `0x321ec`.
+- Watchpoint de 4 bytes em `this+0x127c8`, armado em todas as threads, capturou uma escrita em `scarlett-dxgi` com RIP `0x7ff7d89bbda9` fora da imagem do título (`rva=?`), sugerindo código host/HLE usando a stack do título. A captura é intermitente.
+- Adicionados diagnósticos opt-in `XPORT_LOG_MODULES` (bases de módulos coletadas fora do VEH) e `XPORT_LOG_DXGI_MODE` (slot 21). `locate()` e `read_qword()` dentro do VEH causaram `stack overflow` em worker thread e foram removidos do handler.
+- Log do slot 21 mostrou `word16_target` em endereços de stack do título (`0x...ff230`), não no campo suspeito; a hipótese de `desc.add(4).write(b as u32)` ser a causa não foi confirmada.
+- Estado atual do código: diagnósticos opt-in permanecem, mas atribuição do escritor está pendente. Nenhum dado do título foi gravado no repo; nada commitado.
+- Próximo passo: repetir a captura com `XPORT_LOG_MODULES=1` até obter o RIP, calcular o offset no módulo `xport-cli.exe` e identificar a função HLE que escreve 4 bytes no campo; corrigir a ABI e revalidar.
+
+## Lote 118 — Fase 5: chamadas virtuais indisponíveis e pilha (26/11/2026)
+- O shim de compatibilidade agora reconhece qualquer `call` indireto próximo (`ff /2`, com ou sem REX, com ou sem disp32) cujo registro contenha a palavra de vtable do objeto. Detecta a instrução no RIP ou logo antes do endereço de retorno; valida o bytes da própria imagem em memória, sem patch.
+- Corrigido o empilhamento: ao pular a chamada, o handler emula o `ret` (pop de 8 bytes quando o endereço de retorno está no topo). A versão anterior empurrava a pilha quando não devia, corrompendo frames posteriores.
+- `scarlett-callfix`: shim disparou em `0x327c5`; o título avançou para uma nova falha em `0x321ec` por campo corrompido com metade baixa de ponteiro (`rdi = 0x37dc0369`). Nenhum `out_obj` rejeitado (`XPORT_LOG_OUT_OBJ=1`).
+- Watchpoint opt-in `XPORT_WATCH_WRAPPER_FIELD=1` + `XPORT_BREAK_RVAS=32147`: armado em `this+0x127c8` sem gravar nada; `scarlett-fieldwatch` terminou com `exceptions=0`, `panics=0`, mas ainda `presents=1`.
+- Execução final limpa `scarlett-final-20261126-155937`: shim disparou uma vez, `exceptions=1` em `0x321ec` com ponteiro truncado, `panics=0`. Portanto o shim é determinístico e a corrupção do campo é o próximo bloqueio.
+- Watchpoint de 4 bytes armado em todas as threads não capturou o writer — a escrita ocorre antes da entrada na função `0x32130` ou fora da janela instrumentada. Varredura da imagem em memória por escrita em `+0x127c8` em andamento.
+- Próximo passo exato: identificar o writer de `this+0x127c8`, corrigir a ABI que trunca o ponteiro para 32 bits e só então reavaliar novos presents.
+
+## Lote 117 — Fase 5: chamada de helper inutilizável (26/11/2026)
+- Shim pontual para o helper em `0x332e1`, cujo alvo era um buffer de texto; retoma a instrução seguinte do próprio título. Não altera bytes da imagem.
+- `scarlett-shim6`: shim em `0x327c5` disparou e a exceção seguinte passou para `0x333fb`; a causa raiz era a pilha desalinhada do Lote 118.
+
+## Lote 116 — Fase 5: generalização do shim de slot vazio (26/11/2026)
+- Substituída a lista fixa de RVAs por detecção da própria instrução `call [rax+disp32]` e validação de que `rax` é a palavra de vtable de `rcx`; cobre `0x327c5`, `0x32960` e sites posteriores sem depender de valores de slot que mudam entre execuções.
+- `scarlett-shim5` mostrou que o par `rcx==r14` não é estável entre threads; removido.
+
+## Lote 115 — Fase 5: shim do slot 0x110 e guard anti-UB (26/11/2026)
+- Shim opt-in por exceção: objeto gráfico do título com slot `0x110` inutilizável (`0`, `-1` ou página de dados) retoma em `base+0x327cb`, com log único e nenhum byte da imagem modificado.
+- `d3d12_va_map.rs`: `copy()` falha fechada para tamanho zero/ponteiro nulo, eliminando o panic de `unsafe precondition` em `scarlett-vtbl2`.
+- Validação limpa: fmt, clippy `-D warnings`, testes workspace (`--skip llvm_gfx10_corpus`), build do CLI; `scarlett-shim3` confirmou o primeiro shim.
+
+## Lote 114 — Fase 4: writes host não destravam o loop (26/11/2026)
+- Reexecução de 150 s com `XPORT_LIST_APPLY_WRITES=1 XPORT_LIST_TRUST_HOST_POINTERS=1`: os dois writes antes recusados agora chegaram a células host confirmadas (`0x2d041a26aa8`/`aa0` ← 0), mais um write em heap de descritor; `write_misses=0`, 0 exceções.
+- Continuou com exatamente 1 `frame wait`/1 `present`. O watchpoint opt-in foi armado em 42 threads e a linha monitorada (`0x2c43d6f7640`) segue sem writer CPU. O processo terminou sozinho em ~59 s (watchdog do próprio título), antes dos 150 s. Portanto esses writes não são a publicação esperada pelo spin.
+- Próximo passo exato: instrumentar `xuser`/`xgame_api`/`xsystem_api` com `RUST_LOG=trace` (rede continue bloqueada) para verificar se o bloqueio após o present é de sessão/conta/input, não de fence.
+
+## Lote 113 — Fase 4: host cell validada para writes bottom-of-pipe (26/11/2026)
+- Execução real de 150 s com `XPORT_LIST_APPLY_WRITES=1`: `unimpl24=0`, 11 cópias `#24`, 48 registros VA, 1 write mapeado com sucesso, 2 writes recusados (`0x26057f76e20/e28`), 0 exceções e ainda 1 present/1 frame wait. Os VAs recusados são endereços host já comitados do próprio título, não VAs sintéticos.
+- Seguindo a regra autorizada do fork (`cpu_writes.rs`: `VirtualQuery`, `MEM_COMMIT`, `PAGE_READWRITE`/`PAGE_EXECUTE_READWRITE`, sem `PAGE_GUARD`, alinhamento e extensão), `d3d12_va_map` ganhou `write_any`/`read_any`. O caminho host é opt-in separado `XPORT_LIST_TRUST_HOST_POINTERS=1`; nunca aloca, nunca inventa endereço e continua desligado por padrão.
+- Validação completa: fmt `--check`, clippy `-D warnings`, `cargo test --workspace -q -- --skip llvm_gfx10_corpus` (125 no xport-hle + demais crates) e build do CLI: exit 0.
+- Próximo passo exato: reexecutar 150 s com ambos os opt-ins e `XPORT_LOG_MONITOR=1`/watchpoint para verificar se os writes publicam a linha esperada e se aparecem novos presents.
+
+## Lote 112 — Fase 4: VA→host fail-closed e device #24 (26/11/2026)
+- Novo `d3d12_va_map.rs` autoral: registra apenas intervalos que o XPORT possui (recursos sintéticos e heaps de descritor), resolve offsets com checagem de limites/overflow e recusa base zero, sobreposição e backing curto. VA desconhecido nunca é dereferenciado; `XPORT_LOG_VA_MAP=1` é opt-in.
+- `d3d12_list_sync.rs` agora aplica writes/waits bottom-of-pipe somente a intervalos registrados quando `XPORT_LIST_APPLY_WRITES=1` (parse explícito de `1`/`true`); o padrão continua no-op. `XPORT_LOG_LIST_OPS=1` mostra VAs e sucesso/falha.
+- `new_resource` registra o VA sintético → slice zeroada; `CreateDescriptorHeap` registra o VA reportado ao título → slice opaca do XPORT (sampler = 16 bytes, demais = 32).
+- Device `#24` `CopyDescriptorsSimple` implementado de forma autoral: cópia opaca entre intervalos registrados, `E_INVALIDARG` para args nulos e `S_FALSE` para VA não registrado. `XPORT_LOG_DESCRIPTOR_COPY=1` é opt-in. Isto fecha o último slot não implementado observado.
+- Corrigida flakiness dos testes de frame: `now_us()` mínimo de 1 µs e lock de teste à prova de poison. Validação completa: fmt `--check`, clippy `-D warnings`, `cargo test --workspace -q -- --skip llvm_gfx10_corpus` (124 no xport-hle + demais crates) e build do CLI: exit 0.
+- Próximo passo exato: executar o título real por 150 s com diagnóstico opt-in, `XPORT_LIST_APPLY_WRITES=1`, timeout e saídas fora do repo; verificar `unimpl24=0`, writes mapeados e se surgem novos presents.
+
+## Lote 111 — Fase 4: frame events e watchpoint confirmado (26/11/2026)
+- `XPORT_WATCH_MONITOR_WRITE=1` usa DR3 com filtro por PID; o self-test opt-in provou que o watchpoint dispara na linha monitorada (`...0002` → `...0003`). Sem o self-test, 120 s de título real não mostraram **nenhuma** gravação CPU na linha: o título espera uma publicação que o XPORT ainda descarta.
+- `d3d12_frame.rs` foi reescrito autoralmente seguindo a ABI do fork licenciado: `SetFrameIntervalX` → `S_FALSE`, `ScheduleFrameEventX` → `STARTED_CLOCK`/`S_FALSE`, `WaitFrameEventX` exige evento agendado e emite token só no origin/timeout com flag, `GetFrameStatisticsX` devolve `E_FAIL` até `PresentX` marcar o flip. `frame_completed` agora registra o token lido dos planos sem incrementar contador artificial.
+- Validação completa: `fmt --check`, clippy `--workspace --all-targets -- -D warnings`, `cargo test --workspace -q -- --skip llvm_gfx10_corpus` (120 no xport-hle + demais crates) e build do CLI: exit 0.
+- Próximo passo exato: adicionar registro VA→slice host e tornar as writes bottom-of-pipe opt-in apenas para intervalos registrados, com falha explícita para VA desconhecido.
+
+## Lote 110 — Fase 4: eventos de frame e watchpoint da linha monitorada (26/11/2026)
+- Diagnóstico opt-in `XPORT_LOG_FRAME_EVENTS=1` mostrou apenas: `set_interval(33333)`, schedule dos tipos 0 e 2, um `wait` tipo 0 que devolveu token `1`, e um `present token=1`. Depois do present o título **não volta a chamar `WaitFrameEventX`**; ele reagenda o frame e entra em spin em memória própria.
+- A semântica de `S_FALSE`/`STARTED_CLOCK` do XCL ainda precisa ser portada; por ora foi acrescentado só o trace autoral e opt-in em `d3d12_frame.rs`, sem gravar nada no repo.
+- `XPORT_LOG_MONITOR=1` acrescentou uma leitura limitada da cache line monitorada e do pointee: `0x7ffe800000000002` é um ponteiro para memória do próprio título; nenhum `FenceCell` do XPORT aparece.
+- Foi adicionado o watchpoint opt-in `XPORT_WATCH_MONITOR_WRITE=1` em `crash.rs` (DR3, somente gravação, 8 bytes), com filtro por PID do processo. A primeira execução armou 3561 threads de todo o sistema antes da correção; esse resultado não é confiável e será repetido.
+- Estado: `cargo fmt --all -- --check` e `cargo clippy --workspace --all-targets -- -D warnings` limpos; build do CLI anterior limpo. Próximo passo exato: validar o watchpoint com self-test opt-in e rodar o título para identificar o RIP que escreve a linha, antes de alterar qualquer semântica de frame/present.
+
+## Lote 109 — Fase 4: waits de fence e DirectStorage (26/11/2026)
+- Execução de 600 s sem diagnósticos confirmou: 2 submissões, 1 present, 625/626 criações/fechamentos de lista, 0 exceções. O título não avança para novos frames.
+- `RUST_LOG=debug` mostrou 95.557 instruções `monitorx`/`mwaitx` em dois endereços de código, alternando em ciclos curtos (~0,3 s). `XPORT_LOG_MONITOR=1` identificou a cache line monitorada (`rax`) e o valor `0x7ffe800000000002`, idêntico a um valor publicado por `publish_fence`. Incrementar a célula em diagnóstico opt-in não destravou; a intervenção foi removida.
+- O `XPORT_LOG_FENCE=1` mostrou que o título nunca chama o slot 12 (`completed_value_address`) nesses fences: o endereço monitorado é memória do próprio título, não um `FenceCell` do XPORT.
+- `host_bridge` reportou 4200 enqueues de DirectStorage com `result=0`, lendo diretamente dos `.rpf` como se fossem arquivos raw. Nenhum WARN/ERROR apareceu; o conteúdo entregue não foi validado (nenhum byte de jogo foi copiado ao repo).
+- Próximo passo exato: verificar se o bloqueio é de conta/sessão (`xuser`, `xgame_api`, input) com `RUST_LOG=trace` nesses módulos antes de mexer no parse de `.rpf`.
+
+## Lote 108 — Fase 4: instrumentação revela carregamento contínuo (26/11/2026)
+- `XPORT_LOG_ALL_SLOTS=1` (vtable de trampolines autoral, opt-in) listou todos os slots chamados: `#57` = 8636, `#9` = 1033, `#73` = 585, `#67`/`#62` = 42 cada, além de `#1/#2/#15/#16/#19` etc. O único não implementado continua `#24`.
+- `#57` e `#67` são `DeserializeGraphicsPipelineStateX`/`DeserializeComputePipelineStateX`. Passaram a devolver um `Kind::PipelineState` sintético com S_OK em vez de `E_NOTIMPL` + ponteiro nulo. Nenhum blob é lido ou copiado.
+- `XPORT_LOG_AFTER_PRESENT=1` mostrou que, após o primeiro present, o título não está em retry idêntico: ele continua chamando `#55`, `#86` (root signatures com magic `DXBC`=`0x43425844`), `#25`, `#108`, `#133`, `#18`, `#20`, `#61` e `#24` com hashes/endereços diferentes — carregamento de assets.
+- O comportamento de 2 submissões/1 present em 150 s permaneceu após o PSO sintético. Próximo passo exato: execução longa (600 s) sem diagnósticos para verificar se novos presents ocorrem quando o streaming termina.
+
+## Lote 107 — Fase 4: varredura de marcadores e instrumentação de slots (26/11/2026)
+- `XPORT_DUMP_CL_ARGS=1` leu os buffers de `CreateCommandListX`/`Close`: `create.params` contém `{type, node mask}` e ponteiros de código; `close.b` contém estruturas de 0x80 bytes com IDs sequenciais (`0x88001700`, `0x88001800`, …). Nenhum packet de stream reconhecível nesses buffers.
+- `XPORT_SCAN_STREAM=1` varreu a memória comitida com `VirtualQuery`/`ReadProcessMemory`. A faixa ampla `0x8C0F_E000..=0x8C0F_EFFF` gerou 80 falsos positivos (`39 e8 0f 8c` é código x86). Restrita aos IDs documentados `0x8C0F_E002..=0x8C0F_E00A` e `0x4002_C400`, a varredura encontrou 0 ocorrências: o título usa um formato ainda não documentado ou não grava stream com esses marcadores.
+- Próximo passo exato: instrumentar a vtable sintética (opt-in `XPORT_LOG_ALL_SLOTS=1`) para listar **todos** os slots chamados entre `CreateCommandListX` e `Close`, incluindo os handlers que não emitem `tracing`, e identificar o método que recebe o stream do título.
+
+## Lote 106 — Fase 4: page pool e localização do stream (26/11/2026)
+- Device `#74` identificado no fork licenciado como `RegisterPagePoolX(address, pages, index out)`; `#75` como `UnregisterPagePoolX(index)`. Implementados em módulo autoral `d3d12_page_pool.rs`, com índices estáveis, rejeição de pool nulo/vazio e falha explícita em dupla remoção.
+- O slot 74 é compartilhado entre device e command list na vtable sintética; agora o despacho usa `Kind`, preservando `Wait64BitValueX` na command list e registrando o pool no device.
+- Execução real: nenhum `unimplemented slot` restante além do device `#24` (`CopyDescriptorsSimple`); 2 submissões e 1 present, sem exceções. O título continua em loop de criação de listas após o segundo frame, sem novas chamadas D3D12 relevantes.
+- `XPORT_DUMP_OBJ=1` (com `XPORT_CAPTURE_CL=1`) lê 0x1000 bytes do objeto submetido e imprime só palavras não-zero no stderr do host: não há packets do stream no Obj sintético. Os buffers passados em `CreateCommandListX`/`Close` ainda não foram decodificados.
+- Validação final: `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace -q -- --skip llvm_gfx10_corpus` e `cargo build -p xport-cli`: exit 0. Execução limpa de 150 s sem variáveis de diagnóstico: 0 exceções, apenas o shim de watchdog já documentado; nenhum dado do título gravado no repo.
+- Próximo passo exato: estender o diagnóstico opt-in aos buffers de `CreateCommandListX`/`Close` (somente leitura via `ReadProcessMemory`, saída no stderr fora do repo) e identificar o cabeçalho do stream antes de escrever o decoder da Fase 5.
+
+## Lote 105 — Fase 4: slots newer-layout da command list (26/11/2026)
+- Implementados autoralmente os handlers de command list `#139` Reset, `#32` SetDescriptorHeaps, `#146` UAV barrier, `#52` Write32BitValueBottomOfPipeX, `#72` Write64BitValueBottomOfPipeX e `#74` Wait64BitValueX, com despacho por `Kind::CommandList` para não alterar device/queue/fence.
+- Novo módulo `d3d12_list_sync.rs` registra as operações por lista, marca `Close` e as conclui na submissão. `XPORT_LOG_LIST_OPS=1` é opt-in e escreve só no stderr do host, fora do repo.
+- Diagnóstico real: o título grava 4 operações (3 writes + 1 wait cmp=7) na lista submetida; o wait já estava satisfeito. Os VAs das operações são offsets em memória unificada que o dispositivo offline não mapeia: device `#24` é `CopyDescriptorsSimple` nesses mesmos VAs.
+- Escrever nesses VAs como endereços host causou `0xc0000005` no título (`base + offset`, base variável por execução). A aplicação das escritas passou a ser opt-in (`XPORT_LIST_APPLY_WRITES=1`); o padrão é seguro e não toca memória do título. Nenhum bytes do título foi copiado ao repo.
+- Validação parcial: `cargo fmt --all`, `clippy -p xport-hle --all-targets -- -D warnings` e `cargo test -p xport-hle --lib` passaram (116 aprovados, 3 ignorados). Falta a validação completa do workspace após a última correção.
+- Próximo passo exato: ler o stream de comandos dentro do próprio `Obj` da command list (offsets `+0x18/+0x28/+0x30/+0x344` documentados no fork licenciado) e decodificar os packets em memória, sem gravá-los no repo.
+
+## Lote 104 — Fase 4 em reconhecimento (26/11/2026)
+- Diagnóstico opt-in novo: `XPORT_CAPTURE_CL=1` em `queue_execute_x` imprime (via `ReadProcessMemory`, stderr do host, fora do repo) os ponteiros de `lists[]`, as palavras do objeto e do allocator e o token, no máximo nas duas primeiras submissões. Desligado por padrão.
+- Execuções reais com `RUST_LOG=xport_hle::modules::d3d12_null=trace`, timeout e saídas em `%LOCALAPPDATA%\Temp\opencode`: o título leva longa inicialização (625 `CreateCommandListX`, 626 `Close`, centenas de `GetResourceAllocationInfo`) antes da primeira submissão.
+- Primeira submissão capturada: `count=1`, `token=1`; segunda `token=0x300000001`; depois `queue_present(plane_count=1)`. O objeto submetido é o `Obj` synthetic e o allocator não contém packets reconhecíveis.
+- O array de planos (terceiro argumento) foi capturado: começa `[1, 0, 1, 0, ptr_host 0x7ffd..., ptr_console 0x0d..., ptr_console 0x0d...]`. `queue_present` passou a nomear os parâmetros conforme a ABI observada (`plane_count`, `planes`); nenhum desses endereços foi lido além da amostra ou copiado ao repo.
+- O título não chama `Dispatch`/`SetPipelineState` na command list: grava o stream em memória própria, fora do objeto. Sem formato validado, o decoder da Fase 5 não pode ser implementado. Imediatamente antes da primeira submissão há 61 chamadas ao device #57 (não implementado) — próximo slot a nomear, sem patch de bytes.
+- Validação após a mudança: `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings` e `cargo test --workspace -- --skip llvm_gfx10_corpus`: exit 0. Nenhum diagnóstico/rede na validação padrão; nenhum dado do título copiado ao repo.
+- Próximo passo exato: nomear o device #57 e localizar o buffer de comandos que o título grava fora do `Obj` (somente em memória), antes de propor o decoder da Fase 5.
+
+## Lote 103 — Fase 3 concluída (26/11/2026)
+- Fase 2 concluída e validada no Lote 102: MIMG → HLSL com T#/S# estáticos/dinâmicos e PS sintético compilando em DXC.
+- Implementado na Fase 3: root signature gráfica (`u0..u5` space 0, SRV/sampler tables space 1), PSO gráfico com rasterizador/sample desc/RTV format, heaps RTV/DSV/SRV/sampler, upload de textura sintética, viewport/scissor, `OMSetRenderTargets`, `DrawInstanced`, readback e `IASetVertexBuffers` validado. VS fullscreen autoral usa `SV_VertexID`, portanto o teste não precisa de input layout.
+- Critério satisfeito: `translated_textured_triangle_readback_on_real_hardware` desenhou o triângulo num RT offscreen 4×4 e leu `[32, 96, 160, 255]` nos 16 pixels; PS veio do container sintético com `image_sample` + `exp mrt0`. Sem HWND, sem jogo e sem assets no repo.
+- Correções encontradas no hardware: `SampleDesc.Count` precisa ser 1 no PSO; o SRV precisa de component mapping identidade (o mapping zerado replicava o canal R).
+- Validação: `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace -- --skip llvm_gfx10_corpus`, DXC opt-in e os três testes `d3d12_hw` opt-in: exit 0. Nenhum diagnóstico/rede na validação padrão.
+- Próximo passo exato: reavaliar a Fase 4 (captura em memória de HWND, `lists[]`/token, planos de present, descritores e recursos), sem copiar nada do título ao repo.
+
+## Lote 102 — Fase 2 concluída (26/11/2026)
+- Usuário pediu continuação autônoma até o limite. Nenhum dado do título foi lido ou copiado; fixtures apenas autorais.
+- Implementado: ABI de texturas (`GraphicsTextureDimension`, `GraphicsTextureBinding`, `static_texture_base`), `constant_resources` para T# constants, `mimg` com Sample/Bias/Level/Grad/Cmp/Load, heaps dinâmicos T#/S#, e PS sintético com `image_sample` + `exp mrt0`.
+- Evidência: `synthetic_pixel_container_samples_static_texture` passa; DXC opt-in compila VS/PS/PS texturizado; fmt/clippy/testes do workspace exit 0.
+- Limitação: execução em hardware do PS texturizado depende da assinatura/PSO da Fase 3; o HLSL usa texturas float e não cobre gathers/atomics/MSAA/16-bit.
+
+## Lote 101 — Fase 1 concluída (26/11/2026)
+- Usuário declarou autorização para processar em memória dados entregues pelo título ao HLE. Registrado em `docs/DECISIONS.md`; Fase 0 marcada como resolvida. `ASSET_POLICY.md` permanece: nada do título copiado ao repo.
+- Implementado: `translate_xbox_graphics` e `compile_xbox_graphics` em `xport-shader/src/lib.rs` (VS/PS via `interface()`/`translate()` internos); `GraphicsStage` com perfis DXC `vs_6_6`/`ps_6_6` em `dxc.rs`; containers VS/PS sintéticos com ISG1/OSG1 autorais em `gpu/xbox.rs`; teste opt-in `tests/dxc_graphics.rs`.
+- Evidência: testes VS/PS e rejeição de container CS passam; teste opt-in compilou VS e PS para DXIL com DXC do Windows Kits 10.0.26100.0; `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings` e `cargo test --workspace -- --skip llvm_gfx10_corpus` exit 0. Nenhum blob/dado de jogo lido ou copiado.
+- Limitação restante da Fase 1: o HLSL gráfico ainda usa a ABI UAV `u0/u1/u2` do compute; não há PSO gráfico, RTV/DSV nem draw (Fase 3). MIMG ainda rejeitada (Fase 2).
+- Próximo passo exato: Fase 2 — implementar lowering de `MIMG` para textura/sampler HLSL reaproveitando `constant_samplers`, `sampler_ref`, format table e os mapeadores T#/S# de `xport-gpu`; cobrir com pixel shader sintético com amostragem e validar fmt/clippy/testes.
+
+## Lote 100 — retomada (26/11/2026, aguardando escopo)
+- Já existe: título abre e roda 300 s sem crash, binding 172/415/0/0, shims por hash, fmt/clippy/testes/build limpos (Lotes 97/98). Limitação de renderização documentada no Lote 99.
+- Falta: decidir o próximo objetivo. Candidatas: (a) plano de longo prazo do pipeline gráfico D3D12.X, (b) stubs restantes (slots 24/74, DStorage, BCPACK/page-mode), (c) entrada/controles no título.
+- Escopo escolhido pelo usuário: **avaliar viabilidade do pipeline gráfico** — mapear o necessário para renderizar (command streams de draw, shaders graphics, swapchain host) e produzir plano concreto, sem copiar nada do título, sem implementar ainda.
+- Inventário do HLE D3D12.X concluído: objetos/vtables, pontos exatos onde draws e presents são descartados, recursos zerados, HWND não retido e diagnósticos disponíveis. `docs/GRAPHICS_ROADMAP.md` criado com o resumo executivo, a seção 1 (HLE) e as restrições legais.
+- `docs/GRAPHICS_ROADMAP.md` **concluído**: 7 seções — estado do HLE, tradução de shaders, backend GPU, 6 fases com critérios de saída, riscos e conclusão. Descoberta relevante: boa parte do VS/PS já existe em `gpu::recomp`, mas é privada; MIMG é rejeitada; não há PSO gráfico, RTV/DSV, rasterizador nem swapchain em `xport-gpu`.
+- Conclusão da avaliação: viável em princípio, inviável como incremento curto. Fase 0 exige decisão legal formal sobre processar blobs do título em memória; sem ela, o plano para na fase 3 (fixtures sintéticos).
+- Próximo passo exato: submeter o roadmap ao usuário e aguardar aprovação. **Nenhuma implementação foi iniciada** e nenhum dado de jogo foi lido ou copiado.
+
 ## Estado final (26/11/2026)
 - Escolha do usuário: **documentar e encerrar**. A limitação de renderização está registrada de forma explícita em `README.md`, `STATUS.md` (Lote 99) e `THIRD_PARTY.md`.
 - Entregável real: título verificado abre e roda sem crash por 300 s, com binding completo e sem diagnósticos/rede; **sem renderização de imagem**. Não é compatibilidade de jogo.
