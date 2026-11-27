@@ -1,3 +1,4 @@
+<img width="2048" height="768" alt="XPORT" src="https://github.com/user-attachments/assets/38e0a110-affd-4729-9d7b-69a6fb29f006" />
 # XPORT
 
 XPORT é uma camada de compatibilidade Xbox Series X|S → Windows, construída
